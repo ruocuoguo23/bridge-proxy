@@ -1,0 +1,25 @@
+[package]
+name = "network-bridge-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "A network bridge proxy for blockchain services"
+license = "Apache-2.0"
+
+[dependencies]
+# 工作区共享依赖
+tokio = { version = "1.0", features = ["full"] }
+log = "0.4.21"
+clap = { version = "3.2.25", features = ["derive"] }
+http = "1.1.0"
+env_logger = "0.11.3"
+
+# network-bridge-proxy 特有的依赖
+hyper = { version = "1.6.0", features = ["http1"] }
+hyper-util = { version = "0.1.3", features = ["full"] }
+http-body-util = "0.1.0"
+futures = "0.3.28"
+anyhow = "1.0.71"
+
+[[bin]]
+name = "network-bridge-proxy"
+path = "src/main.rs"

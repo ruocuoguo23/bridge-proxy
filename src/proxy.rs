@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use hyper::body::{Bytes, Incoming};
 use http_body_util::{Full};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
@@ -10,7 +10,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
-use http::header::HeaderValue;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use hyper::server::conn::http1::Builder as Http1Builder;
 
 use crate::config::Config;
@@ -31,12 +31,6 @@ impl TunnelProxy {
     pub async fn start(&self) -> Result<()> {
         let config = self.config.clone();
 
-        // Create HTTP client
-        let http_client = Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(config.idle_timeout())
-            .pool_max_idle_per_host(config.max_idle_connections)
-            .build_http();
-
         // Bind address and start server
         let addr = self.config.address.parse::<SocketAddr>()
             .with_context(|| format!("Failed to parse address: {}", self.config.address))?;
@@ -53,56 +47,83 @@ impl TunnelProxy {
                 }
             };
 
-            let http_client = http_client.clone();
             let config = config.clone();
 
             // Spawn a task to handle each connection
             tokio::spawn(async move {
-                let service = service_fn(move |req| {
-                    let http_client = http_client.clone();
-                    let config = config.clone();
-                    async move {
-                        Self::handle_request(req, http_client, config).await
-                    }
-                });
-
-                // Wrap TcpStream with TokioIo to make it compatible with hyper's I/O traits
-                let io = TokioIo::new(stream);
-                let conn = Http1Builder::new()
-                    .serve_connection(io, service)
-                    .await;
-
-                if let Err(e) = conn {
-                    error!("Connection error: {}", e);
+                if let Err(e) = Self::handle_connection(stream, config).await {
+                    error!("Connection handling error: {}", e);
                 }
             });
         }
     }
 
-    /// Handle client requests
-    async fn handle_request(
-        req: Request<Incoming>,
-        http_client: Client<HttpConnector, Full<Bytes>>,
-        config: Arc<Config>
-    ) -> Result<Response<Full<Bytes>>> {
-        info!("Received request: {} {}", req.method(), req.uri());
+    /// Handle a single TCP connection
+    async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> Result<()> {
+        // Read the first line to determine if it's a CONNECT request
+        let mut buffer = [0; 4096];
+        let n = stream.read(&mut buffer).await?;
+        let request_data = &buffer[..n];
+        let request_str = String::from_utf8_lossy(request_data);
 
-        // Handle CONNECT method (HTTPS tunnel)
-        if req.method() == Method::CONNECT {
-            return Self::handle_connect(req, config).await;
+        // Check if this is a CONNECT request
+        if request_str.starts_with("CONNECT ") {
+            // Handle CONNECT request directly
+            Self::handle_connect_direct(stream, request_str.to_string(), config).await
+        } else {
+            // Handle as regular HTTP request using hyper
+            // Put the data back by creating a new stream with the buffered data
+            let mut full_stream = std::io::Cursor::new(request_data.to_vec());
+            full_stream.set_position(0);
+
+            // Create HTTP client for regular requests
+            let http_client = Client::builder(TokioExecutor::new())
+                .pool_idle_timeout(config.idle_timeout())
+                .pool_max_idle_per_host(config.max_idle_connections)
+                .build_http();
+
+            let service = service_fn(move |req| {
+                let http_client = http_client.clone();
+                let config = config.clone();
+                async move {
+                    Self::handle_http(req, http_client, config).await
+                }
+            });
+
+            // Create a combined stream with buffered data + original stream
+            let combined_stream = CombinedStream::new(request_data.to_vec(), stream);
+            let io = TokioIo::new(combined_stream);
+
+            let conn = Http1Builder::new()
+                .serve_connection(io, service)
+                .await;
+
+            if let Err(e) = conn {
+                error!("HTTP connection error: {}", e);
+            }
+            Ok(())
         }
-
-        // Handle regular HTTP requests
-        Self::handle_http(req, http_client, config).await
     }
 
-    /// Handle HTTPS CONNECT requests
-    async fn handle_connect(req: Request<Incoming>, config: Arc<Config>) -> Result<Response<Full<Bytes>>> {
-        // Extract target host and port from URI
-        let host = req.uri().authority()
-            .ok_or_else(|| anyhow::anyhow!("URI missing authority"))?
-            .to_string();
+    /// Handle CONNECT request directly at TCP level
+    async fn handle_connect_direct(
+        mut client_stream: TcpStream,
+        request: String,
+        config: Arc<Config>
+    ) -> Result<()> {
+        // Parse the CONNECT request to extract host and port
+        let lines: Vec<&str> = request.lines().collect();
+        if lines.is_empty() {
+            return Err(anyhow::anyhow!("Invalid CONNECT request"));
+        }
 
+        let first_line = lines[0];
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        if parts.len() < 2 || parts[0] != "CONNECT" {
+            return Err(anyhow::anyhow!("Invalid CONNECT request format"));
+        }
+
+        let host = parts[1];
         info!("HTTPS CONNECT request for {}", host);
 
         // Try to resolve host to socket address
@@ -116,53 +137,26 @@ impl TunnelProxy {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
                 error!("Failed to connect to {}: {}", host, e);
-                let response = Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Full::new(Bytes::new()))?;
-                return Ok(response);
+                let response = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+                let _ = client_stream.write_all(response.as_bytes()).await;
+                return Err(e.into());
             }
             Err(_) => {
                 error!("Connection to {} timed out", host);
-                let response = Response::builder()
-                    .status(StatusCode::GATEWAY_TIMEOUT)
-                    .body(Full::new(Bytes::new()))?;
-                return Ok(response);
+                let response = "HTTP/1.1 504 Gateway Timeout\r\n\r\n";
+                let _ = client_stream.write_all(response.as_bytes()).await;
+                return Err(anyhow::anyhow!("Connection timeout"));
             }
         };
 
         info!("Connected to {}", host);
 
-        // Create a special response to let hyper know we're taking over the connection
-        let mut response = Response::builder()
-            .status(StatusCode::OK)
-            .body(Full::new(Bytes::new()))?; // Use Full<Bytes> instead of Empty
+        // Send 200 Connection Established response
+        let response = "HTTP/1.1 200 Connection Established\r\n\r\n";
+        client_stream.write_all(response.as_bytes()).await?;
 
-        // Set upgrade flag to indicate we want to take over the connection
-        response.headers_mut().insert(
-            hyper::header::CONNECTION,
-            HeaderValue::from_static("Upgrade"),
-        );
-
-        let on_upgrade = hyper::upgrade::on(req);
-
-        // Spawn a task to handle the upgrade once it completes
-        tokio::spawn(async move {
-            match on_upgrade.await {
-                Ok(upgraded) => {
-                    // 将 upgraded 转换为实现 AsyncRead/AsyncWrite 的类型
-                    let upgraded_io = TokioIo::new(upgraded);
-                    
-                    if let Err(e) = tunnel::create_tunnel(upgraded_io, target_stream, config.timeout()).await {
-                        error!("Tunnel error for {}: {}", host, e);
-                    }
-                }
-                Err(e) => {
-                    error!("Upgrade failed for {}: {}", host, e);
-                }
-            }
-        });
-
-        Ok(response)
+        // Create tunnel between client and target
+        tunnel::create_tunnel(client_stream, target_stream, config.timeout()).await
     }
 
     /// Handle regular HTTP requests
@@ -256,5 +250,71 @@ impl TunnelProxy {
                 )
             }
         }
+    }
+}
+
+/// A stream that combines buffered data with a TCP stream
+struct CombinedStream {
+    buffer: std::io::Cursor<Vec<u8>>,
+    stream: TcpStream,
+    buffer_exhausted: bool,
+}
+
+impl CombinedStream {
+    fn new(buffer_data: Vec<u8>, stream: TcpStream) -> Self {
+        Self {
+            buffer: std::io::Cursor::new(buffer_data),
+            stream,
+            buffer_exhausted: false,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for CombinedStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if !self.buffer_exhausted {
+            let mut temp_buf = vec![0; buf.remaining()];
+            match std::io::Read::read(&mut self.buffer, &mut temp_buf) {
+                Ok(0) => {
+                    self.buffer_exhausted = true;
+                }
+                Ok(n) => {
+                    buf.put_slice(&temp_buf[..n]);
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                Err(e) => return std::task::Poll::Ready(Err(e)),
+            }
+        }
+
+        // Buffer exhausted, read from the actual stream
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for CombinedStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }

@@ -7,19 +7,15 @@ mod proxy;
 mod tunnel;
 mod config;
 
-use config::Config;
+use config::{Config, LOG_CONFIG};
 use proxy::TunnelProxy;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about = "HTTP/HTTPS Tunnel Proxy for Blockchain Services")]
 struct CliArgs {
     /// Address to listen on
-    #[clap(short, long, default_value = "127.0.0.1:8080")]
+    #[clap(short, long, default_value = "0.0.0.0:8080")]
     address: String,
-    
-    /// Enable verbose logging
-    #[clap(short, long)]
-    verbose: bool,
     
     /// Connection timeout in seconds
     #[clap(short, long, default_value = "10")]
@@ -28,8 +24,9 @@ struct CliArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
-    env_logger::init();
+    // Initialize log4rs
+    let config = serde_yaml::from_str::<log4rs::config::RawConfig>(&LOG_CONFIG.to_string()).unwrap();
+    log4rs::init_raw_config(config).unwrap();
 
     info!("Starting network-bridge-proxy tunnel service...");
 
@@ -39,7 +36,6 @@ async fn main() -> Result<()> {
     // Create proxy configuration
     let config = Arc::new(Config {
         address: args.address.clone(),
-        verbose: args.verbose,
         timeout_seconds: args.timeout,
         max_idle_connections: 100,
         idle_timeout_seconds: 90,

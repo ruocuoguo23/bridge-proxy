@@ -5,7 +5,7 @@ use http_body_util::{Full};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper::service::service_fn;
-use log::{debug, error, info};
+use log::{error, info};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -85,9 +85,7 @@ impl TunnelProxy {
         http_client: Client<HttpConnector, Full<Bytes>>,
         config: Arc<Config>
     ) -> Result<Response<Full<Bytes>>> {
-        if config.verbose {
-            debug!("Received request: {} {}", req.method(), req.uri());
-        }
+        info!("Received request: {} {}", req.method(), req.uri());
 
         // Handle CONNECT method (HTTPS tunnel)
         if req.method() == Method::CONNECT {
@@ -105,9 +103,7 @@ impl TunnelProxy {
             .ok_or_else(|| anyhow::anyhow!("URI missing authority"))?
             .to_string();
 
-        if config.verbose {
-            info!("HTTPS CONNECT request for {}", host);
-        }
+        info!("HTTPS CONNECT request for {}", host);
 
         // Try to resolve host to socket address
         let addr = host.to_socket_addrs()
@@ -134,9 +130,7 @@ impl TunnelProxy {
             }
         };
 
-        if config.verbose {
-            debug!("Connected to target: {}", host);
-        }
+        info!("Connected to {}", host);
 
         // Create a special response to let hyper know we're taking over the connection
         let mut response = Response::builder()
@@ -158,7 +152,7 @@ impl TunnelProxy {
                     // 将 upgraded 转换为实现 AsyncRead/AsyncWrite 的类型
                     let upgraded_io = TokioIo::new(upgraded);
                     
-                    if let Err(e) = tunnel::create_tunnel(upgraded_io, target_stream, config.timeout(), config.verbose).await {
+                    if let Err(e) = tunnel::create_tunnel(upgraded_io, target_stream, config.timeout()).await {
                         error!("Tunnel error for {}: {}", host, e);
                     }
                 }
@@ -181,9 +175,7 @@ impl TunnelProxy {
         let uri = req.uri().clone();
         let method = req.method().clone();
 
-        if config.verbose {
-            debug!("Handling HTTP request: {} {}", method, uri);
-        }
+        info!("Handling HTTP request: {} {}", method, uri);
 
         // Copy headers before consuming the request
         let mut headers = Vec::new();
@@ -223,10 +215,8 @@ impl TunnelProxy {
         // Send request to target server
         match timeout(config.timeout(), http_client.request(target_req)).await {
             Ok(Ok(response)) => {
-                if config.verbose {
-                    debug!("Received response: {} for {}", response.status(), uri);
-                }
-                
+                info!("Received response: {} for {}", response.status(), uri);
+
                 // Convert the response body
                 let (parts, body) = response.into_parts();
                 let body_bytes = match http_body_util::BodyExt::collect(body).await {

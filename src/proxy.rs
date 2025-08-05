@@ -9,7 +9,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use log::{error, info};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
@@ -59,10 +59,10 @@ impl TunnelProxy {
     }
 
     /// Handle a single TCP connection
-    async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> Result<()> {
-        // Read the first line to determine if it's a CONNECT request
+    async fn handle_connection(stream: TcpStream, config: Arc<Config>) -> Result<()> {
+        // Use peek instead of read to detect request type
         let mut buffer = [0; 4096];
-        let n = stream.read(&mut buffer).await?;
+        let n = stream.peek(&mut buffer).await?;
         let request_data = &buffer[..n];
         let request_str = String::from_utf8_lossy(request_data);
 
@@ -71,10 +71,8 @@ impl TunnelProxy {
             // Handle CONNECT request directly
             Self::handle_connect_direct(stream, request_str.to_string(), config).await
         } else {
-            // Handle as regular HTTP request using hyper
-            // Put the data back by creating a new stream with the buffered data
-            let mut full_stream = std::io::Cursor::new(request_data.to_vec());
-            full_stream.set_position(0);
+            // Directly use hyper to handle HTTP requests, no need for CombinedStream
+            let io = TokioIo::new(stream);
 
             // Create HTTP client for regular requests
             let http_client = Client::builder(TokioExecutor::new())
@@ -89,10 +87,6 @@ impl TunnelProxy {
                     Self::handle_http(req, http_client, config).await
                 }
             });
-
-            // Create a combined stream with buffered data + original stream
-            let combined_stream = CombinedStream::new(request_data.to_vec(), stream);
-            let io = TokioIo::new(combined_stream);
 
             let conn = Http1Builder::new()
                 .serve_connection(io, service)
@@ -250,72 +244,6 @@ impl TunnelProxy {
                 )
             }
         }
-    }
-}
-
-/// A stream that combines buffered data with a TCP stream
-struct CombinedStream {
-    buffer: std::io::Cursor<Vec<u8>>,
-    stream: TcpStream,
-    buffer_exhausted: bool,
-}
-
-impl CombinedStream {
-    fn new(buffer_data: Vec<u8>, stream: TcpStream) -> Self {
-        Self {
-            buffer: std::io::Cursor::new(buffer_data),
-            stream,
-            buffer_exhausted: false,
-        }
-    }
-}
-
-impl tokio::io::AsyncRead for CombinedStream {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        if !self.buffer_exhausted {
-            let mut temp_buf = vec![0; buf.remaining()];
-            match std::io::Read::read(&mut self.buffer, &mut temp_buf) {
-                Ok(0) => {
-                    self.buffer_exhausted = true;
-                }
-                Ok(n) => {
-                    buf.put_slice(&temp_buf[..n]);
-                    return std::task::Poll::Ready(Ok(()));
-                }
-                Err(e) => return std::task::Poll::Ready(Err(e)),
-            }
-        }
-
-        // Buffer exhausted, read from the actual stream
-        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
-    }
-}
-
-impl tokio::io::AsyncWrite for CombinedStream {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 
@@ -657,28 +585,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_combined_stream_read() {
-        let test_data = b"Hello, World!";
-        let tcp_stream = create_mock_tcp_stream().await;
-        let mut combined_stream = CombinedStream::new(test_data.to_vec(), tcp_stream);
-
-        let mut buf = [0; 20];
-        let n = combined_stream.read(&mut buf).await.unwrap();
-        assert_eq!(n, test_data.len());
-        assert_eq!(&buf[..n], test_data);
-    }
-
-    #[tokio::test]
-    async fn test_combined_stream_write() {
-        let tcp_stream = create_mock_tcp_stream().await;
-        let mut combined_stream = CombinedStream::new(vec![], tcp_stream);
-
-        let test_data = b"Test write data";
-        let n = combined_stream.write(test_data).await.unwrap();
-        assert_eq!(n, test_data.len());
-    }
-
-    #[tokio::test]
     async fn test_parse_connect_request_valid() {
         let request = "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
         let _config = create_test_config();
@@ -789,26 +695,6 @@ mod tests {
 
             assert_eq!(response.status(), status);
         }
-    }
-
-    // Helper function to create a mock TCP stream for testing
-    async fn create_mock_tcp_stream() -> TcpStream {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            // Echo server for testing
-            let mut buf = [0; 1024];
-            while let Ok(n) = stream.read(&mut buf).await {
-                if n == 0 {
-                    break;
-                }
-                let _ = stream.write_all(&buf[..n]).await;
-            }
-        });
-
-        TcpStream::connect(addr).await.unwrap()
     }
 
     #[tokio::test]

@@ -1,4 +1,8 @@
-use std::fmt;
+use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 use std::time::Duration;
 
 pub const LOG_CONFIG: &str = r#"
@@ -27,19 +31,32 @@ root:
 "#;
 
 /// Proxy server configuration
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     /// Listening address
+    #[serde(rename = "Address")]
     pub address: String,
     /// Connection timeout (seconds)
+    #[serde(rename = "TimeoutSeconds")]
     pub timeout_seconds: u64,
     /// Maximum number of idle connections
+    #[serde(rename = "MaxIdleConnections")]
     pub max_idle_connections: usize,
     /// Idle connection timeout (seconds)
+    #[serde(rename = "IdleTimeoutSeconds")]
     pub idle_timeout_seconds: u64,
 }
 
 impl Config {
+    /// Load configuration from YAML file
+    pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn Error>> {
+        let mut file = File::open(path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        let config: Config = serde_yaml::from_str(&contents)?;
+        Ok(config)
+    }
+
     /// Get connection timeout duration
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(self.timeout_seconds)
@@ -51,13 +68,13 @@ impl Config {
     }
 }
 
-impl fmt::Debug for Config {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Config")
-            .field("address", &self.address)
-            .field("timeout", &format!("{}s", self.timeout_seconds))
-            .field("max_idle_connections", &self.max_idle_connections)
-            .field("idle_timeout", &format!("{}s", self.idle_timeout_seconds))
-            .finish()
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            address: "0.0.0.0:8080".to_string(),
+            timeout_seconds: 10,
+            max_idle_connections: 100,
+            idle_timeout_seconds: 90,
+        }
     }
 }

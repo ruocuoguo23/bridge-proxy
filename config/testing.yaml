@@ -1,0 +1,13 @@
+# Network Bridge Proxy Configuration
+
+# Listening address and port
+Address: "0.0.0.0:8080"
+
+# Connection timeout in seconds
+TimeoutSeconds: 10
+
+# Maximum number of idle connections to maintain
+MaxIdleConnections: 100
+
+# Idle connection timeout in seconds
+IdleTimeoutSeconds: 90

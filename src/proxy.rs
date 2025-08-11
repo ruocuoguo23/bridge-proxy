@@ -10,7 +10,7 @@ use log::{error, info};
 use std::collections::HashSet;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt, BufReader, AsyncBufReadExt};
+use tokio::io::{AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
@@ -173,7 +173,7 @@ impl TunnelProxy {
         let mut buf = Vec::with_capacity(1024);
 
         loop {
-            // 扩容缓冲区
+            // Expand buffer capacity
             if buf.len() < 1024 {
                 buf.resize(buf.len() + 1024, 0);
             }
@@ -183,10 +183,10 @@ impl TunnelProxy {
             }
             let view = &buf[..n];
 
-            // 查找 \r\n\r\n
+            // Look for \r\n\r\n
             if let Some(pos) = view.windows(4).position(|w| w == b"\r\n\r\n") {
                 let header_len = pos + 4;
-                // 精确消费 header_len 字节
+                // Precisely consume header_len bytes
                 let mut throwaway = vec![0u8; header_len];
                 stream.read_exact(&mut throwaway).await?;
                 return Ok(());
@@ -196,8 +196,8 @@ impl TunnelProxy {
                 return Err(anyhow::anyhow!("CONNECT headers too large (max: {} bytes)", MAX));
             }
 
-            // 继续下一轮 peek（TcpStream 的 peek 返回当前内核接收缓冲内的可读数据）
-            // 这里不需要清空 buf，因为我们每轮都覆盖前 n 字节
+            // Continue to next round of peek (TcpStream's peek returns currently readable data in kernel receive buffer)
+            // No need to clear buf here since we overwrite the first n bytes each round
         }
     }
 

@@ -167,32 +167,38 @@ impl TunnelProxy {
 
     /// Consume complete CONNECT request headers until CRLF CRLF
     async fn consume_connect_headers(stream: &mut TcpStream) -> Result<()> {
-        let mut buf_reader = BufReader::new(stream);
-        let mut total_read = 0;
-        let mut line = String::new();
+        use tokio::io::AsyncReadExt;
+
+        const MAX: usize = MAX_CONNECT_HEADER_SIZE;
+        let mut buf = Vec::with_capacity(1024);
 
         loop {
-            line.clear();
-            let bytes_read = buf_reader.read_line(&mut line).await?;
-
-            // Check for DoS protection
-            total_read += bytes_read;
-            if total_read > MAX_CONNECT_HEADER_SIZE {
-                return Err(anyhow::anyhow!("CONNECT headers too large (max: {} bytes)", MAX_CONNECT_HEADER_SIZE));
+            // 扩容缓冲区
+            if buf.len() < 1024 {
+                buf.resize(buf.len() + 1024, 0);
             }
-
-            // If we can't read anything, connection is closed
-            if bytes_read == 0 {
+            let n = stream.peek(&mut buf).await?;
+            if n == 0 {
                 return Err(anyhow::anyhow!("Connection closed while reading headers"));
             }
+            let view = &buf[..n];
 
-            // Check for end of headers (empty line: just CRLF or LF)
-            if line == "\r\n" || line == "\n" {
-                break;
+            // 查找 \r\n\r\n
+            if let Some(pos) = view.windows(4).position(|w| w == b"\r\n\r\n") {
+                let header_len = pos + 4;
+                // 精确消费 header_len 字节
+                let mut throwaway = vec![0u8; header_len];
+                stream.read_exact(&mut throwaway).await?;
+                return Ok(());
             }
-        }
 
-        Ok(())
+            if n >= MAX {
+                return Err(anyhow::anyhow!("CONNECT headers too large (max: {} bytes)", MAX));
+            }
+
+            // 继续下一轮 peek（TcpStream 的 peek 返回当前内核接收缓冲内的可读数据）
+            // 这里不需要清空 buf，因为我们每轮都覆盖前 n 字节
+        }
     }
 
     /// Remove hop-by-hop headers according to RFC 7230

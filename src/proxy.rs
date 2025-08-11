@@ -16,6 +16,7 @@ use tokio::time::timeout;
 
 use crate::config::Config;
 use crate::tunnel;
+use crate::metrics;
 
 /// Maximum size for CONNECT request headers (16KB)
 const MAX_CONNECT_HEADER_SIZE: usize = 16 * 1024;
@@ -64,9 +65,18 @@ impl TunnelProxy {
 
     /// Handle a single TCP connection
     async fn handle_connection(stream: TcpStream, config: Arc<Config>) -> Result<()> {
+        // Record inbound connection
+        metrics::inc_connections_total("inbound");
+
         // Use peek instead of read to detect request type
         let mut buffer = [0; 4096];
-        let n = stream.peek(&mut buffer).await?;
+        let n = match stream.peek(&mut buffer).await {
+            Ok(n) => n,
+            Err(e) => {
+                metrics::inc_errors_total("read_error");
+                return Err(e.into());
+            }
+        };
         let request_data = &buffer[..n];
         let request_str = String::from_utf8_lossy(request_data);
 
@@ -97,6 +107,7 @@ impl TunnelProxy {
                 .await;
 
             if let Err(e) = conn {
+                metrics::inc_errors_total("http_connection_error");
                 error!("HTTP connection error: {}", e);
             }
             Ok(())
@@ -112,12 +123,14 @@ impl TunnelProxy {
         // Parse the CONNECT request to extract host and port
         let lines: Vec<&str> = request.lines().collect();
         if lines.is_empty() {
+            metrics::inc_errors_total("invalid_connect_request");
             return Err(anyhow::anyhow!("Invalid CONNECT request"));
         }
 
         let first_line = lines[0];
         let parts: Vec<&str> = first_line.split_whitespace().collect();
         if parts.len() < 2 || parts[0] != "CONNECT" {
+            metrics::inc_errors_total("invalid_connect_format");
             return Err(anyhow::anyhow!("Invalid CONNECT request format"));
         }
 
@@ -126,6 +139,7 @@ impl TunnelProxy {
 
         // Consume the complete CONNECT request headers from the stream
         if let Err(e) = Self::consume_connect_headers(&mut client_stream).await {
+            metrics::inc_errors_total("invalid_connect_headers");
             error!("Failed to consume CONNECT headers: {}", e);
             let response = "HTTP/1.1 400 Bad Request\r\n\r\n";
             let _ = client_stream.write_all(response.as_bytes()).await;
@@ -133,21 +147,41 @@ impl TunnelProxy {
         }
 
         // Try to resolve host to socket address
-        let addr = host.to_socket_addrs()
-            .with_context(|| format!("Failed to resolve host: {}", host))?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Failed to resolve host: {}", host))?;
+        let addr = match host.to_socket_addrs() {
+            Ok(mut addrs) => {
+                match addrs.next() {
+                    Some(addr) => addr,
+                    None => {
+                        metrics::inc_errors_total("dns_resolution_failed");
+                        let response = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+                        let _ = client_stream.write_all(response.as_bytes()).await;
+                        return Err(anyhow::anyhow!("Failed to resolve host: {}", host));
+                    }
+                }
+            },
+            Err(e) => {
+                metrics::inc_errors_total("dns_resolution_failed");
+                let response = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+                let _ = client_stream.write_all(response.as_bytes()).await;
+                return Err(e.into());
+            }
+        };
 
         // Connect to target server
         let target_stream = match timeout(config.timeout(), TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => stream,
+            Ok(Ok(stream)) => {
+                metrics::inc_connections_total("outbound");
+                stream
+            },
             Ok(Err(e)) => {
+                metrics::inc_errors_total("connection_failed");
                 error!("Failed to connect to {}: {}", host, e);
                 let response = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
                 let _ = client_stream.write_all(response.as_bytes()).await;
                 return Err(e.into());
             }
             Err(_) => {
+                metrics::inc_errors_total("connection_timeout");
                 error!("Connection to {} timed out", host);
                 let response = "HTTP/1.1 504 Gateway Timeout\r\n\r\n";
                 let _ = client_stream.write_all(response.as_bytes()).await;
@@ -272,8 +306,13 @@ impl TunnelProxy {
         // Read the request body
         let (_parts, body) = req.into_parts();
         let body_bytes = match http_body_util::BodyExt::collect(body).await {
-            Ok(collected) => collected.to_bytes(),
+            Ok(collected) => {
+                let bytes = collected.to_bytes();
+                metrics::add_data_transferred("in", bytes.len() as u64);
+                bytes
+            },
             Err(e) => {
+                metrics::inc_errors_total("request_body_read_error");
                 error!("Failed to read request body: {}", e);
                 let response = Response::builder()
                     .status(StatusCode::BAD_REQUEST)
@@ -298,13 +337,19 @@ impl TunnelProxy {
         // Send request to target server
         match timeout(config.timeout(), http_client.request(target_req)).await {
             Ok(Ok(response)) => {
+                metrics::inc_connections_total("outbound");
                 info!("Received response: {} for {}", response.status(), uri);
 
                 // Convert the response body
                 let (parts, body) = response.into_parts();
                 let body_bytes = match http_body_util::BodyExt::collect(body).await {
-                    Ok(collected) => collected.to_bytes(),
+                    Ok(collected) => {
+                        let bytes = collected.to_bytes();
+                        metrics::add_data_transferred("out", bytes.len() as u64);
+                        bytes
+                    },
                     Err(e) => {
+                        metrics::inc_errors_total("response_body_read_error");
                         error!("Failed to read response body: {}", e);
                         return Ok(Response::builder()
                             .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -335,6 +380,7 @@ impl TunnelProxy {
                 Ok(builder.body(Full::new(body_bytes))?)
             },
             Ok(Err(e)) => {
+                metrics::inc_errors_total("http_request_error");
                 error!("HTTP request error for {}: {}", uri, e);
                 Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
@@ -342,6 +388,7 @@ impl TunnelProxy {
                 )
             }
             Err(_) => {
+                metrics::inc_errors_total("http_request_timeout");
                 error!("HTTP request timed out for {}", uri);
                 Ok(Response::builder()
                     .status(StatusCode::GATEWAY_TIMEOUT)
@@ -367,6 +414,7 @@ mod tests {
             timeout_seconds: 5,
             max_idle_connections: 10,
             idle_timeout_seconds: 30,
+            metrics_address: None,
         })
     }
 
@@ -458,6 +506,7 @@ mod tests {
             timeout_seconds: 5,
             max_idle_connections: 10,
             idle_timeout_seconds: 30,
+            metrics_address: None,
         });
 
         // Start the proxy
@@ -515,6 +564,7 @@ mod tests {
             timeout_seconds: 5,
             max_idle_connections: 10,
             idle_timeout_seconds: 30,
+            metrics_address: None,
         });
 
         // Start the proxy
@@ -581,6 +631,7 @@ mod tests {
             timeout_seconds: 5,
             max_idle_connections: 10,
             idle_timeout_seconds: 30,
+            metrics_address: None,
         });
 
         // Start the proxy
@@ -653,6 +704,7 @@ mod tests {
             timeout_seconds: 1, // Short timeout for testing
             max_idle_connections: 10,
             idle_timeout_seconds: 30,
+            metrics_address: None,
         });
 
         // Start the proxy

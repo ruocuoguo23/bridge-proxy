@@ -11,3 +11,7 @@ MaxIdleConnections: 100
 
 # Idle connection timeout in seconds
 IdleTimeoutSeconds: 90
+
+# Metrics server address (optional)
+# Uncomment the line below to enable metrics endpoint
+MetricsAddress: "0.0.0.0:9090"

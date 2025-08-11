@@ -7,6 +7,7 @@ use std::path::PathBuf;
 mod proxy;
 mod tunnel;
 mod config;
+mod metrics;
 
 use config::{Config, LOG_CONFIG};
 use proxy::TunnelProxy;
@@ -25,6 +26,10 @@ struct CliArgs {
     /// Connection timeout in seconds (overrides config file)
     #[clap(short, long)]
     timeout: Option<u64>,
+
+    /// Metrics server address (overrides config file)
+    #[clap(short, long)]
+    metrics_address: Option<String>,
 }
 
 #[tokio::main]
@@ -58,11 +63,46 @@ async fn main() -> Result<()> {
     if let Some(timeout) = args.timeout {
         config.timeout_seconds = timeout;
     }
+    if let Some(metrics_address) = args.metrics_address {
+        config.metrics_address = Some(metrics_address);
+    }
 
     let config = Arc::new(config);
 
     info!("Proxy configuration: {:?}", config);
-    
+
+    // Initialize metrics
+    if let Err(e) = metrics::init_metrics("bridge_proxy") {
+        error!("Failed to initialize metrics: {}", e);
+        return Err(e.into());
+    }
+    info!("Metrics initialized successfully");
+
+    // Start metrics server if configured
+    let _metrics_handle = if let Some(ref metrics_addr) = config.metrics_address {
+        match metrics_addr.parse() {
+            Ok(addr) => {
+                match metrics::start_metrics_server(addr).await {
+                    Ok(handle) => {
+                        info!("Metrics server started on {}", metrics_addr);
+                        Some(handle)
+                    }
+                    Err(e) => {
+                        error!("Failed to start metrics server: {}", e);
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Invalid metrics address '{}': {}", metrics_addr, e);
+                return Err(e.into());
+            }
+        }
+    } else {
+        info!("Metrics server disabled (no metrics address configured)");
+        None
+    };
+
     // Create and start proxy service
     let proxy = TunnelProxy::new(config);
     

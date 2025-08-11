@@ -45,6 +45,9 @@ pub struct Config {
     /// Idle connection timeout (seconds)
     #[serde(rename = "IdleTimeoutSeconds")]
     pub idle_timeout_seconds: u64,
+    /// Metrics server address
+    #[serde(rename = "MetricsAddress")]
+    pub metrics_address: Option<String>,
 }
 
 impl Config {
@@ -75,6 +78,7 @@ impl Default for Config {
             timeout_seconds: 10,
             max_idle_connections: 100,
             idle_timeout_seconds: 90,
+            metrics_address: None,
         }
     }
 }

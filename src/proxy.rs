@@ -7,14 +7,18 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use log::{error, info};
+use std::collections::HashSet;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt};
+use tokio::io::{AsyncWriteExt, BufReader, AsyncBufReadExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use crate::config::Config;
 use crate::tunnel;
+
+/// Maximum size for CONNECT request headers (16KB)
+const MAX_CONNECT_HEADER_SIZE: usize = 16 * 1024;
 
 /// HTTP/HTTPS tunnel proxy service
 pub struct TunnelProxy {
@@ -120,6 +124,14 @@ impl TunnelProxy {
         let host = parts[1];
         info!("HTTPS CONNECT request for {}", host);
 
+        // Consume the complete CONNECT request headers from the stream
+        if let Err(e) = Self::consume_connect_headers(&mut client_stream).await {
+            error!("Failed to consume CONNECT headers: {}", e);
+            let response = "HTTP/1.1 400 Bad Request\r\n\r\n";
+            let _ = client_stream.write_all(response.as_bytes()).await;
+            return Err(e);
+        }
+
         // Try to resolve host to socket address
         let addr = host.to_socket_addrs()
             .with_context(|| format!("Failed to resolve host: {}", host))?
@@ -153,6 +165,89 @@ impl TunnelProxy {
         tunnel::create_tunnel(client_stream, target_stream, config.timeout()).await
     }
 
+    /// Consume complete CONNECT request headers until CRLF CRLF
+    async fn consume_connect_headers(stream: &mut TcpStream) -> Result<()> {
+        let mut buf_reader = BufReader::new(stream);
+        let mut total_read = 0;
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            let bytes_read = buf_reader.read_line(&mut line).await?;
+
+            // Check for DoS protection
+            total_read += bytes_read;
+            if total_read > MAX_CONNECT_HEADER_SIZE {
+                return Err(anyhow::anyhow!("CONNECT headers too large (max: {} bytes)", MAX_CONNECT_HEADER_SIZE));
+            }
+
+            // If we can't read anything, connection is closed
+            if bytes_read == 0 {
+                return Err(anyhow::anyhow!("Connection closed while reading headers"));
+            }
+
+            // Check for end of headers (empty line: just CRLF or LF)
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove hop-by-hop headers according to RFC 7230
+    fn remove_hop_by_hop_headers(headers: &hyper::HeaderMap) -> Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> {
+        // Standard hop-by-hop headers as defined in RFC 7230
+        let standard_hop_by_hop: HashSet<&str> = [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailers",
+            "transfer-encoding",
+            "upgrade"
+        ].iter().cloned().collect();
+
+        // Parse Connection header to get additional hop-by-hop headers
+        let mut additional_hop_by_hop = HashSet::new();
+        if let Some(connection_value) = headers.get("connection") {
+            if let Ok(connection_str) = connection_value.to_str() {
+                for token in connection_str.split(',') {
+                    let token = token.trim().to_lowercase();
+                    if !token.is_empty() {
+                        additional_hop_by_hop.insert(token);
+                    }
+                }
+            }
+        }
+
+        // Filter out hop-by-hop headers
+        let mut filtered_headers = Vec::new();
+        for (name, value) in headers.iter() {
+            let name_str = name.as_str().to_lowercase();
+
+            // Skip if it's a standard hop-by-hop header
+            if standard_hop_by_hop.contains(name_str.as_str()) {
+                continue;
+            }
+
+            // Skip if it's listed in Connection header
+            if additional_hop_by_hop.contains(&name_str) {
+                continue;
+            }
+
+            // Skip proxy-* headers
+            if name_str.starts_with("proxy-") {
+                continue;
+            }
+
+            filtered_headers.push((name.clone(), value.clone()));
+        }
+
+        filtered_headers
+    }
+
     /// Handle regular HTTP requests
     async fn handle_http(
         req: Request<Incoming>,
@@ -165,15 +260,9 @@ impl TunnelProxy {
 
         info!("Handling HTTP request: {} {}", method, uri);
 
-        // Copy headers before consuming the request
-        let mut headers = Vec::new();
-        for (name, value) in req.headers().iter() {
-            let name_str = name.as_str().to_lowercase();
-            if !name_str.starts_with("proxy-") {
-                headers.push((name.clone(), value.clone()));
-            }
-        }
-        
+        // Remove hop-by-hop headers from request
+        let filtered_headers = Self::remove_hop_by_hop_headers(req.headers());
+
         // Read the request body
         let (_parts, body) = req.into_parts();
         let body_bytes = match http_body_util::BodyExt::collect(body).await {
@@ -192,9 +281,9 @@ impl TunnelProxy {
             .method(method)
             .uri(uri.clone());
 
-        // Add headers to the target request
+        // Add filtered headers to the target request
         let headers_mut = target_req.headers_mut().unwrap();
-        for (name, value) in headers {
+        for (name, value) in filtered_headers {
             headers_mut.insert(name, value);
         }
 
@@ -220,11 +309,21 @@ impl TunnelProxy {
                 let mut builder = Response::builder()
                     .status(parts.status);
                 
-                // Copy headers
-                for (name, value) in parts.headers {
-                    if let Some(name) = name {
-                        builder = builder.header(name, value);
+                // Remove hop-by-hop headers from response
+                let filtered_response_headers = Self::remove_hop_by_hop_headers(&parts.headers);
+
+                // Add filtered headers, but skip content-length and transfer-encoding
+                // since we're using Full<Bytes> which will set content-length automatically
+                let headers_mut = builder.headers_mut().unwrap();
+                for (name, value) in filtered_response_headers {
+                    let name_str = name.as_str().to_lowercase();
+
+                    // Skip content-length and transfer-encoding as hyper will set them correctly
+                    if name_str == "content-length" || name_str == "transfer-encoding" {
+                        continue;
                     }
+
+                    headers_mut.insert(name, value);
                 }
                 
                 Ok(builder.body(Full::new(body_bytes))?)
